@@ -50,12 +50,32 @@ def update_plan_status(row_idx, status_value):
     worksheet.update_cell(row_idx + 2, 4, status_value)
 
 
-# --- 3. 기상청 단기예보 API 연동 (조회 시간 기준 이후 12시간 필터링) ---
-@st.cache_data(ttl=900) # 15분 캐싱
-def get_suwon_hourly_weather():
+# --- 3. 기상청 단기예보 API 연동 (실시간 필터링 적용) ---
+
+@st.cache_data(ttl=1800) # 원본 API 호출만 30분간 캐싱 (서버 부하 방지)
+def fetch_kma_raw_data(base_date, base_time):
+    """기상청 서버에서 원본 데이터를 안전하게 받아오는 함수"""
     url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
     service_key = st.secrets["weather"]["api_key"]
     
+    params = {
+        "serviceKey": service_key,
+        "pageNo": "1",
+        "numOfRows": "300", # 12시간 분량을 충분히 확보하기 위해 넉넉히 데이터 로드
+        "dataType": "JSON",
+        "base_date": base_date,
+        "base_time": base_time,
+        "nx": str(NX),
+        "ny": str(NY)
+    }
+    try:
+        res = requests.get(url, params=params, timeout=5)
+        return res.json()
+    except Exception:
+        return None
+
+def get_suwon_hourly_weather():
+    """현재 '조회하는 순간'의 스마트폰 시간을 기준으로 이후 12시간만 정확히 필터링"""
     now = datetime.datetime.now()
     available_hours = [2, 5, 8, 11, 14, 17, 20, 23]
     current_hour = now.hour
@@ -75,92 +95,78 @@ def get_suwon_hourly_weather():
         
     base_time = f"{base_hour:02d}00"
     
-    params = {
-        "serviceKey": service_key,
-        "pageNo": "1",
-        "numOfRows": "300", # 이후 12시간을 안정적으로 확보하기 위해 데이터 로드 양을 충분히 늘림
-        "dataType": "JSON",
-        "base_date": base_date,
-        "base_time": base_time,
-        "nx": str(NX),
-        "ny": str(NY)
-    }
+    # 1. 캐싱된 원본 기상청 데이터 로드
+    raw_data = fetch_kma_raw_data(base_date, base_time)
     
-    try:
-        res = requests.get(url, params=params, timeout=5)
-        data = res.json()
-        items = data['response']['body']['items']['item']
-        
-        # 시간대별 데이터 묶기
-        hourly_dict = {}
-        for item in items:
-            key = (item['fcstDate'], item['fcstTime'])
-            if key not in hourly_dict:
-                hourly_dict[key] = {}
-            hourly_dict[key][item['category']] = item['fcstValue']
-            
-        parsed_records = []
-        
-        # 🛠️ 기준 시간 설정 (현재 시간의 '정각' 분/초 초기화)
-        current_hour_dt = now.replace(minute=0, second=0, microsecond=0)
-        
-        for (f_date, f_time), categories in sorted(hourly_dict.items()):
-            # 예보 날짜와 시간을 datetime 객체로 변환
-            f_dt = datetime.datetime.strptime(f_date + f_time, "%Y%m%d%H%M")
-            
-            # 🛠️ [핵심 조건] 예보 시간이 현재 정각보다 과거라면 표기에서 제외하고 패스
-            if f_dt < current_hour_dt:
-                continue
-                
-            # 현재 시간 이후로 딱 12시간만 채워지면 루프 종료
-            if len(parsed_records) >= 12:
-                break
-                
-            f_date_obj = f_dt.date()
-            date_label = "오늘" if f_date_obj == now.date() else "내일"
-            time_label = f"{f_time[:2]}:00"
-            
-            temp = f"{categories.get('TMP', '-')}°C"
-            precipitation = categories.get('PCP', '-')
-            if precipitation == "강수없음":
-                precipitation = "0mm"
-                
-            sky_code = categories.get('SKY', '1')
-            sky_icon = {"1": "☀️", "3": "☁️", "4": "☁️"}.get(sky_code, "☀️")
-            
-            parsed_records.append({
-                "일자": date_label,
-                "시간": time_label,
-                "날씨": sky_icon,
-                "온도": temp,
-                "강수량": precipitation
-            })
-            
-        return pd.DataFrame(parsed_records)
-        
-    except Exception:
+    if not raw_data or 'response' not in raw_data or 'body' not in raw_data or 'items' not in raw_data:
         return pd.DataFrame([
-            {"일자": "오늘", "시간": "현재", "날씨": "🔄", "온도": "연동중", "강수량": "0mm"}
+            {"일자": "오늘", "시간": "현재", "날씨": "🔄", "온도": "날씨 데이터 점검 중", "강수량": "0mm"}
         ])
+        
+    items = raw_data['response']['body']['items']['item']
+    
+    # 2. 시간대별로 카테고리 데이터 묶기
+    hourly_dict = {}
+    for item in items:
+        key = (item['fcstDate'], item['fcstTime'])
+        if key not in hourly_dict:
+            hourly_dict[key] = {}
+        hourly_dict[key][item['category']] = item['fcstValue']
+        
+    parsed_records = []
+    
+    # 3. 실시간 필터링 루프 규칙 정의
+    for (f_date, f_time), categories in sorted(hourly_dict.items()):
+        f_dt = datetime.datetime.strptime(f_date + f_time, "%Y%m%d%H%M")
+        
+        # 🎯 [핵심 로직] 예보 시간이 앱을 조회한 현재 시점보다 '과거이거나 같으면' 무조건 패스(제외)
+        if f_dt <= now:
+            continue
+            
+        # 오직 조회 기준 '이후' 미래 데이터가 12개 채워지면 즉시 종료
+        if len(parsed_records) >= 12:
+            break
+            
+        f_date_obj = f_dt.date()
+        date_label = "오늘" if f_date_obj == now.date() else "내일"
+        time_label = f"{f_time[:2]}:00"
+        
+        temp = f"{categories.get('TMP', '-')}°C"
+        precipitation = categories.get('PCP', '-')
+        if precipitation == "강수없음":
+            precipitation = "0mm"
+            
+        sky_code = categories.get('SKY', '1')
+        sky_icon = {"1": "☀️", "3": "☁️", "4": "☁️"}.get(sky_code, "☀️")
+        
+        parsed_records.append({
+            "일자": date_label,
+            "시간": time_label,
+            "날씨": sky_icon,
+            "온도": temp,
+            "강수량": precipitation
+        })
+        
+    return pd.DataFrame(parsed_records)
 
 
-# --- 4. 메인 어플리케이션 레이아웃 ---
+# --- 4. 메인 UI 화면 구성 ---
 
 st.title("💪 오늘 운동 완료!")
 
-# 데이터 로드
+# 구글 스프레드시트 데이터 실시간 로드
 plan_df = load_sheet_data(0)
 record_df = load_sheet_data(1)
 
 main_tabs = st.tabs(["🏠 홈 / 날씨", "📅 운동 계획", "✅ 기록 입력"])
 
 # ---------------------------------------------------------
-# Tab 1: 🏠 홈 / 날씨 및 현황판
+# Tab 1: 🏠 홈 / 날씨 및 운동 현황
 # ---------------------------------------------------------
 with main_tabs[0]:
-    st.markdown("### 🌤️ 경기(수원) 시간대별 날씨 예보")
+    st.markdown("### 🌤️ 경기(수원) 시간대별 날씨 예보 (이후 12시간)")
     
-    # 현재 시간 이후 12시간 정렬된 데이터프레임 출력
+    # 언제 새로고침하든 조회 시점 기준 12시간만 완벽 출력됨
     weather_df = get_suwon_hourly_weather()
     
     st.dataframe(
@@ -171,15 +177,12 @@ with main_tabs[0]:
     
     # 실시간 강수 알림 가이드
     if not weather_df.empty and "강수량" in weather_df.columns:
-        # 0mm가 아닌 행 필터링
         rain_rows = weather_df[weather_df["강수량"] != "0mm"]
         if not rain_rows.empty:
             first_rain_idx = rain_rows.index[0]
-            rain_time = weather_df.loc[first_rain_idx, '시간']
-            rain_date = weather_df.loc[first_rain_idx, '일자']
-            st.warning(f"⚠️ {rain_date} {rain_time}에 비 예보가 있습니다! 운동 스케줄을 조정해 보세요.")
+            st.warning(f"⚠️ {weather_df.loc[first_rain_idx, '일자']} {weather_df.loc[first_rain_idx, '시간']}에 비 예보({weather_df.loc[first_rain_idx, '강수량']})가 있습니다! 스케줄을 확인하세요.")
         else:
-            st.info("💡 향후 12시간 동안 비 소식이 없습니다. 실외 운동을 즐기기 좋습니다!")
+            st.info("💡 향후 12시간 동안 비 소식이 없습니다. 야외 운동하기 최고입니다!")
 
     st.markdown("---")
 
@@ -222,7 +225,7 @@ with main_tabs[1]:
             new_row = [str(plan_date), exercise_type, target_amount, "⏳ 대기"]
             append_to_sheet(0, new_row)
             
-            st.cache_data.clear()
+            st.cache_data.clear() 
             st.success("계획이 저장되었습니다! 🏠 홈 탭에서 확인하세요.")
             st.rerun()
 
@@ -258,7 +261,7 @@ with main_tabs[2]:
                     append_to_sheet(1, record_row)
                     update_plan_status(int(selected_idx), status)
                     
-                    st.cache_data.clear()
+                    st.cache_data.clear() 
                     st.success("스프레드시트 결과 반영 성공! 오늘도 고생하셨습니다.")
                     st.rerun()
         else:
