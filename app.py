@@ -50,14 +50,11 @@ def update_plan_status(row_idx, status_value):
     worksheet.update_cell(row_idx + 2, 4, status_value)
 
 
-# --- 3. 기상청 단기예보 API 연동 (디버깅 레이어 추가) ---
+# --- 3. 기상청 단기예보 API 연동 ---
 
-@st.cache_data(ttl=600) # 디버깅을 위해 캐싱 시간을 10분으로 단축
+@st.cache_data(ttl=1800) # 원본 API 호출만 30분간 캐싱
 def fetch_kma_raw_data(base_date, base_time):
-    """기상청 서버에서 원본 데이터를 받아오며 에러를 추적합니다."""
     url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
-    
-    # ⚠️ 서비스키 양쪽 공백 제거
     service_key = st.secrets["weather"]["api_key"].strip()
     
     params = {
@@ -70,26 +67,18 @@ def fetch_kma_raw_data(base_date, base_time):
         "nx": str(NX),
         "ny": str(NY)
     }
-    
     try:
         res = requests.get(url, params=params, timeout=7)
-        
-        # HTTP 상태 코드가 200이 아닐 때
         if res.status_code != 200:
-            return {"error": f"기상청 서버 연결 실패 (HTTP 상태코드: {res.status_code})"}
-            
-        # 기상청은 에러가 나면 JSON이 아닌 XML(텍스트)을 주므로 json 변환 예외처리 처리
+            return {"error": f"기상청 서버 연결 실패 (HTTP: {res.status_code})"}
         try:
             return res.json()
         except Exception:
-            # 반환된 XML 에러 메세지를 그대로 화면에 보여주기 위함
-            return {"error": f"기상청 인증/시스템 에러 발생: {res.text}"}
-            
+            return {"error": f"기상청 시스템 에러 발생: {res.text}"}
     except Exception as e:
         return {"error": f"네트워크 통신 오류: {str(e)}"}
 
 def get_suwon_hourly_weather():
-    """현재 조회하는 순간의 시간을 기준으로 이후 12시간 필터링 및 에러 노출"""
     now = datetime.datetime.now()
     available_hours = [2, 5, 8, 11, 14, 17, 20, 23]
     current_hour = now.hour
@@ -109,17 +98,15 @@ def get_suwon_hourly_weather():
         
     base_time = f"{base_hour:02d}00"
     
-    # 원본 데이터 가져오기
     raw_data = fetch_kma_raw_data(base_date, base_time)
     
-    # 🚨 에러가 감지되면 화면에 에러를 띄우고 빈 데이터프레임 반환
     if "error" in raw_data:
         st.error(raw_data["error"])
         return pd.DataFrame()
         
     try:
-        if 'response' not in raw_data or 'body' not in raw_data or 'items' not in raw_data:
-            # 기상청 에러 결과 메시지 추출
+        # 🛠️ [버그 수정 완료] JSON 데이터의 트리 구조 깊이(Depth)를 올바르게 검사하도록 수정
+        if 'response' not in raw_data or 'body' not in raw_data['response'] or 'items' not in raw_data['response']['body']:
             msg = raw_data.get('response', {}).get('header', {}).get('resultMsg', '데이터 구조 오류')
             st.error(f"기상청 응답 에러 메시지: {msg}")
             return pd.DataFrame()
@@ -168,7 +155,7 @@ def get_suwon_hourly_weather():
         return pd.DataFrame(parsed_records)
         
     except Exception as e:
-        st.error(f"데이터 파싱 중 내부 오류가 발생했습니다: {e}")
+        st.error(f"데이터 가공 중 오류 발생: {e}")
         return pd.DataFrame()
 
 
@@ -203,8 +190,6 @@ with main_tabs[0]:
                 st.warning(f"⚠️ {weather_df.loc[first_rain_idx, '일자']} {weather_df.loc[first_rain_idx, '시간']}에 비 예보({weather_df.loc[first_rain_idx, '강수량']})가 있습니다!")
             else:
                 st.info("💡 향후 12시간 동안 비 소식이 없습니다. 야외 운동하기 최고입니다!")
-    else:
-        st.warning("⚠️ 위의 에러 메시지를 확인하여 기상청 API 설정을 점검해 주세요.")
 
     st.markdown("---")
 
