@@ -65,22 +65,34 @@ def update_sheet_row(worksheet_idx, row_idx, row_data):
         worksheet.update_cell(row_idx + 2, col_idx, str(value))
 
 
-# --- 3. 기상청 단기예보 API 연동 ---
+# --- 3. 기상청 단기예보 API 연동 (HTTPS 및 차단 우회 헤더 추가) ---
+
 @st.cache_data(ttl=1800)
 def fetch_kma_raw_data(base_date, base_time):
-    url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
+    # 🛠️ [보안 변경] http -> https 프로토콜 변경 적용
+    url = "https://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
     service_key = st.secrets["weather"]["api_key"].strip()
+    
+    # 🛠️ [차단 우회] 해외 서버 IP 필터링을 통과하기 위한 PC 웹브라우저 가짜 식별 헤더 정의
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
     
     params = {
         "serviceKey": service_key, "pageNo": "1", "numOfRows": "300", 
         "dataType": "JSON", "base_date": base_date, "base_time": base_time, "nx": str(NX), "ny": str(NY)
     }
     try:
-        res = requests.get(url, params=params, timeout=7)
-        if res.status_code != 200: return {"error": "기상청 서버 연결 실패"}
-        try: return res.json()
-        except: return {"error": "기상청 시스템 응답 오류"}
-    except Exception as e: return {"error": str(e)}
+        # headers 인자 대입 완료
+        res = requests.get(url, params=params, headers=headers, timeout=7)
+        if res.status_code != 200: 
+            return {"error": f"기상청 서버 점검 중 또는 지연 (HTTP 통신 상태코드: {res.status_code})"}
+        try: 
+            return res.json()
+        except: 
+            return {"error": f"기상청 시스템 응답 오류: {res.text}"}
+    except Exception as e: 
+        return {"error": f"네트워크 타임아웃 혹은 연결 거부: {str(e)}"}
 
 def get_suwon_hourly_weather():
     now = datetime.datetime.now(KST).replace(tzinfo=None)
@@ -144,7 +156,6 @@ def get_suwon_hourly_weather():
 
 st.title("💪 오늘 운동 완료!")
 
-# 데이터 실시간 로드
 plan_df = load_sheet_data(0)
 record_df = load_sheet_data(1)
 
@@ -170,22 +181,17 @@ with main_tabs[0]:
                 st.info("💡 향후 6시간 동안 비 소식이 없습니다. 야외 운동하기 최고입니다!")
 
     st.markdown("---")
-    
-    # 🛠️ [기능 고도화] 오늘 / 주별 / 월별 진행률 계산 영역
     st.markdown("### 📊 나의 운동 달성도 분석")
     
     if not plan_df.empty and "상태" in plan_df.columns and "날짜" in plan_df.columns:
-        # 안전한 날짜 데이터 매핑 (문자열 -> Date 객체)
         plan_df['parsed_date'] = pd.to_datetime(plan_df['날짜'], errors='coerce').dt.date
         current_date = now_kst.date()
         
-        # 1️⃣ 오늘 진행률
         today_df = plan_df[plan_df['parsed_date'] == current_date]
         t_total = len(today_df)
         t_done = len(today_df[today_df['상태'] == "✅ 완료"])
         t_rate = int((t_done / t_total) * 100) if t_total > 0 else 0
         
-        # 2️⃣ 이번 주 진행률 (현재 요일 기준 월요일 ~ 일요일 계산)
         start_of_week = current_date - datetime.timedelta(days=current_date.weekday())
         end_of_week = start_of_week + datetime.timedelta(days=6)
         week_df = plan_df[(plan_df['parsed_date'] >= start_of_week) & (plan_df['parsed_date'] <= end_of_week)]
@@ -193,31 +199,22 @@ with main_tabs[0]:
         w_done = len(week_df[week_df['상태'] == "✅ 완료"])
         w_rate = int((w_done / w_total) * 100) if w_total > 0 else 0
         
-        # 3️⃣ 이번 달 진행률
         month_df = plan_df[plan_df['parsed_date'].apply(lambda x: x.year == current_date.year and x.month == current_date.month if pd.notnull(x) else False)]
         m_total = len(month_df)
         m_done = len(month_df[month_df['상태'] == "✅ 완료"])
         m_rate = int((m_done / m_total) * 100) if m_total > 0 else 0
         
-        # 모바일용 스택 레이아웃 출력
         st.markdown("**📅 오늘 달성률**")
-        if t_total > 0:
-            st.progress(t_rate / 100, text=f"{t_total}개 중 {t_done}개 성공 ({t_rate}%)")
-        else:
-            st.caption("오늘 예정된 운동 계획이 없습니다.")
+        if t_total > 0: st.progress(t_rate / 100, text=f"{t_total}개 중 {t_done}개 성공 ({t_rate}%)")
+        else: st.caption("오늘 예정된 운동 계획이 없습니다.")
             
         st.markdown("**📅 이번 주 달성률 (월~일)**")
-        if w_total > 0:
-            st.progress(w_rate / 100, text=f"{w_total}개 중 {w_done}개 성공 ({w_rate}%)")
-        else:
-            st.caption("이번 주에 등록된 운동 계획이 없습니다.")
+        if w_total > 0: st.progress(w_rate / 100, text=f"{w_total}개 중 {w_done}개 성공 ({w_rate}%)")
+        else: st.caption("이번 주에 등록된 운동 계획이 없습니다.")
             
         st.markdown("**📅 이번 달 달성률**")
-        if m_total > 0:
-            st.progress(m_rate / 100, text=f"{m_total}개 중 {m_done}개 성공 ({m_rate}%)")
-        else:
-            st.caption("이번 달에 등록된 운동 계획이 없습니다.")
-            
+        if m_total > 0: st.progress(m_rate / 100, text=f"{m_total}개 중 {m_done}개 성공 ({m_rate}%)")
+        else: st.caption("이번 달에 등록된 운동 계획이 없습니다.")
     else:
         st.caption("⏳ 데이터 분석을 위해 먼저 운동 계획을 등록해 주세요!")
 
@@ -228,7 +225,6 @@ with main_tabs[0]:
         display_df = plan_df
         if filter_status != "전체":
             display_df = plan_df[plan_df["상태"] == filter_status]
-        # 임시 생성한 날짜 파싱 컬럼은 제외하고 출력
         if 'parsed_date' in display_df.columns:
             display_df = display_df.drop(columns=['parsed_date'])
         st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -279,7 +275,7 @@ with main_tabs[2]:
         st.warning("스프레드시트 데이터를 가져올 수 없습니다.")
 
 # ---------------------------------------------------------
-# Tab 4: ⚙️ 데이터 관리 (수정 및 삭제 통합)
+# Tab 4: ⚙️ 데이터 관리
 # ---------------------------------------------------------
 with main_tabs[3]:
     st.markdown("### ⚙️ 계획 및 기록 데이터 관리")
