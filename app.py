@@ -13,13 +13,12 @@ st.set_page_config(
 )
 
 SPREADSHEET_ID = "16tI6GP6KSHkK6nprGOVuuzO5aeZu2YSch-dadJqm4hw"
-# 경기(수원) 기상청 격자 좌표 고정
-NX, NY = 60, 121 
+NX, NY = 60, 121 # 경기(수원) 좌표
 
-# 🛠️ [시간대 고정] 한국 표준시(KST) 타임존 정의
+# 대한민국 표준시(KST) 타임존 정의
 KST = datetime.timezone(datetime.timedelta(hours=9))
 
-# --- 2. 구글 스프레드시트 연동 함수 ---
+# --- 2. 구글 스프레드시트 연동 및 수정/삭제 유틸리티 ---
 @st.cache_resource
 def get_gspread_client():
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -52,39 +51,42 @@ def update_plan_status(row_idx, status_value):
     worksheet = sh.get_worksheet(0)
     worksheet.update_cell(row_idx + 2, 4, status_value)
 
+# 🛠️ [신규 기능] 구글 시트 행 삭제 함수
+def delete_sheet_row(worksheet_idx, row_idx):
+    client = get_gspread_client()
+    sh = client.open_by_key(SPREADSHEET_ID)
+    worksheet = sh.get_worksheet(worksheet_idx)
+    # 헤더 행(1행)이 있으므로 데이터프레임 인덱스에 +2를 하여 삭제
+    worksheet.delete_rows(row_idx + 2)
+
+# 🛠️ [신규 기능] 구글 시트 행 수정 함수 (버전 미스매치 방지를 위해 셀 단위 안전 갱신)
+def update_sheet_row(worksheet_idx, row_idx, row_data):
+    client = get_gspread_client()
+    sh = client.open_by_key(SPREADSHEET_ID)
+    worksheet = sh.get_worksheet(worksheet_idx)
+    for col_idx, value in enumerate(row_data, start=1):
+        worksheet.update_cell(row_idx + 2, col_idx, str(value))
+
 
 # --- 3. 기상청 단기예보 API 연동 ---
-
 @st.cache_data(ttl=1800)
 def fetch_kma_raw_data(base_date, base_time):
     url = "http://apis.data.go.kr/1360000/VilageFcstInfoService_2.0/getVilageFcst"
     service_key = st.secrets["weather"]["api_key"].strip()
     
     params = {
-        "serviceKey": service_key,
-        "pageNo": "1",
-        "numOfRows": "300", 
-        "dataType": "JSON",
-        "base_date": base_date,
-        "base_time": base_time,
-        "nx": str(NX),
-        "ny": str(NY)
+        "serviceKey": service_key, "pageNo": "1", "numOfRows": "300", 
+        "dataType": "JSON", "base_date": base_date, "base_time": base_time, "nx": str(NX), "ny": str(NY)
     }
     try:
         res = requests.get(url, params=params, timeout=7)
-        if res.status_code != 200:
-            return {"error": f"기상청 서버 연결 실패 (HTTP: {res.status_code})"}
-        try:
-            return res.json()
-        except Exception:
-            return {"error": f"기상청 시스템 에러 발생: {res.text}"}
-    except Exception as e:
-        return {"error": f"네트워크 통신 오류: {str(e)}"}
+        if res.status_code != 200: return {"error": "기상청 서버 연결 실패"}
+        try: return res.json()
+        except: return {"error": "기상청 시스템 응답 오류"}
+    except Exception as e: return {"error": str(e)}
 
 def get_suwon_hourly_weather():
-    # 🛠️ [수정] 서버 시간이 아닌 한국 표준시(KST) 기준으로 현재 시간 획득
     now = datetime.datetime.now(KST).replace(tzinfo=None)
-    
     available_hours = [2, 5, 8, 11, 14, 17, 20, 23]
     current_hour = now.hour
     
@@ -94,72 +96,50 @@ def get_suwon_hourly_weather():
         if current_hour >= h:
             base_hour = h
             break
-            
     if current_hour < 2:
         base_date = (now - datetime.timedelta(days=1)).strftime("%Y%m%d")
         base_hour = 23
     else:
         base_date = now.strftime("%Y%m%d")
-        
     base_time = f"{base_hour:02d}00"
     
     raw_data = fetch_kma_raw_data(base_date, base_time)
-    
     if "error" in raw_data:
         st.error(raw_data["error"])
         return pd.DataFrame()
         
     try:
         if 'response' not in raw_data or 'body' not in raw_data['response'] or 'items' not in raw_data['response']['body']:
-            msg = raw_data.get('response', {}).get('header', {}).get('resultMsg', '데이터 구조 오류')
-            st.error(f"기상청 응답 에러 메시지: {msg}")
             return pd.DataFrame()
             
         items = raw_data['response']['body']['items']['item']
-        
         hourly_dict = {}
         for item in items:
             key = (item['fcstDate'], item['fcstTime'])
-            if key not in hourly_dict:
-                hourly_dict[key] = {}
+            if key not in hourly_dict: hourly_dict[key] = {}
             hourly_dict[key][item['category']] = item['fcstValue']
             
         parsed_records = []
-        
         for (f_date, f_time), categories in sorted(hourly_dict.items()):
             f_dt = datetime.datetime.strptime(f_date + f_time, "%Y%m%d%H%M")
-            
-            # 한국 시간 기준 '이후' 시간대만 필터링
-            if f_dt <= now:
-                continue
-                
-            if len(parsed_records) >= 6:
-                break
+            if f_dt <= now: continue
+            if len(parsed_records) >= 6: break
                 
             f_date_obj = f_dt.date()
             date_label = "오늘" if f_date_obj == now.date() else "내일"
             time_label = f"{f_time[:2]}:00"
-            
             temp = f"{categories.get('TMP', '-')}°C"
             precipitation = categories.get('PCP', '-')
-            if precipitation == "강수없음":
-                precipitation = "0mm"
-                
+            if precipitation == "강수없음": precipitation = "0mm"
+            
             sky_code = categories.get('SKY', '1')
             sky_icon = {"1": "☀️", "3": "☁️", "4": "☁️"}.get(sky_code, "☀️")
             
             parsed_records.append({
-                "일자": date_label,
-                "시간": time_label,
-                "날씨": sky_icon,
-                "온도": temp,
-                "강수량": precipitation
+                "일자": date_label, "시간": time_label, "날씨": sky_icon, "온도": temp, "강수량": precipitation
             })
-            
         return pd.DataFrame(parsed_records)
-        
-    except Exception as e:
-        st.error(f"데이터 가공 중 오류 발생: {e}")
+    except:
         return pd.DataFrame()
 
 
@@ -167,42 +147,33 @@ def get_suwon_hourly_weather():
 
 st.title("💪 오늘 운동 완료!")
 
+# 데이터 실시간 로드
 plan_df = load_sheet_data(0)
 record_df = load_sheet_data(1)
 
-main_tabs = st.tabs(["🏠 홈 / 날씨", "📅 운동 계획", "✅ 기록 입력"])
+# 🛠️ 관리 탭 메뉴 추가
+main_tabs = st.tabs(["🏠 홈 / 날씨", "📅 운동 계획", "✅ 기록 입력", "⚙️ 수정/삭제"])
 
 # ---------------------------------------------------------
 # Tab 1: 🏠 홈 / 날씨 및 운동 현황
 # ---------------------------------------------------------
 with main_tabs[0]:
     st.markdown("### 🌤️ 경기(수원) 시간대별 날씨 예보 (이후 6시간)")
-    
-    # 🛠️ [수정] 상단 조회 시간 표기도 한국 표준시(KST)로 정확하게 출력
     now_kst = datetime.datetime.now(KST)
-    current_time_str = now_kst.strftime("%Y년 %m월 %d일 %H시 %M분 %S초")
-    st.markdown(f"**🕒 현재 조회 시간:** `{current_time_str}`")
+    st.markdown(f"**🕒 현재 조회 시간:** `{now_kst.strftime('%Y년 %m월 %d일 %H시 %M분 %S초')}`")
     st.markdown("") 
     
     weather_df = get_suwon_hourly_weather()
-    
     if not weather_df.empty:
-        st.dataframe(
-            weather_df,
-            use_container_width=True,
-            hide_index=True
-        )
-        
+        st.dataframe(weather_df, use_container_width=True, hide_index=True)
         if "강수량" in weather_df.columns:
             rain_rows = weather_df[weather_df["강수량"] != "0mm"]
             if not rain_rows.empty:
-                first_rain_idx = rain_rows.index[0]
-                st.warning(f"⚠️ {weather_df.loc[first_rain_idx, '일자']} {weather_df.loc[first_rain_idx, '시간']}에 비 예보({weather_df.loc[first_rain_idx, '강수량']})가 있습니다!")
+                st.warning(f"⚠️ {weather_df.loc[rain_rows.index[0], '일자']} {weather_df.loc[rain_rows.index[0], '시간']}에 비 예보가 있습니다!")
             else:
                 st.info("💡 향후 6시간 동안 비 소식이 없습니다. 야외 운동하기 최고입니다!")
 
     st.markdown("---")
-
     st.markdown("### 🔥 오늘 나의 달성 현황")
     if not plan_df.empty and "상태" in plan_df.columns:
         total_plans = len(plan_df)
@@ -210,10 +181,9 @@ with main_tabs[0]:
         success_rate = int((done_plans / total_plans) * 100) if total_plans > 0 else 0
         st.progress(success_rate / 100, text=f"목표 {total_plans}개 중 {done_plans}개 성공 ({success_rate}%)")
     else:
-        st.caption("⏳ 아직 등록된 운동 계획이 없습니다. [📅 운동 계획] 탭에서 첫 계획을 세워보세요!")
+        st.caption("⏳ 아직 등록된 운동 계획이 없습니다.")
 
     st.markdown("---")
-
     st.markdown("### 📋 전체 계획 내역")
     if not plan_df.empty:
         filter_status = st.segmented_control("정렬 필터", ["전체", "⏳ 대기", "✅ 완료"], default="전체")
@@ -227,22 +197,16 @@ with main_tabs[0]:
 # ---------------------------------------------------------
 with main_tabs[1]:
     st.markdown("### 📅 새로운 운동 계획")
-    
     with st.form("mobile_plan_form", clear_on_submit=True):
         plan_date = st.date_input("운동 날짜", datetime.datetime.now(KST).date())
         exercise_type = st.selectbox("어떤 운동을 할까요?", ["러닝", "스쿼트", "벤치프레스", "데드리프트", "플랭크", "직접 입력"])
-        
-        if exercise_type == "직접 입력":
-            exercise_type = st.text_input("운동 이름을 써주세요")
-            
+        if exercise_type == "직접 입력": exercise_type = st.text_input("운동 이름을 써주세요")
         target_amount = st.text_input("목표량 (예: 5km, 100개)")
         
-        submit_plan = st.form_submit_button("📅 계획 시트에 저장", use_container_width=True)
-        if submit_plan:
-            new_row = [str(plan_date), exercise_type, target_amount, "⏳ 대기"]
-            append_to_sheet(0, new_row)
+        if st.form_submit_button("📅 계획 시트에 저장", use_container_width=True):
+            append_to_sheet(0, [str(plan_date), exercise_type, target_amount, "⏳ 대기"])
             st.cache_data.clear() 
-            st.success("계획이 저장되었습니다! 🏠 홈 탭에서 확인하세요.")
+            st.success("계획이 저장되었습니다!")
             st.rerun()
 
 # ---------------------------------------------------------
@@ -250,38 +214,95 @@ with main_tabs[1]:
 # ---------------------------------------------------------
 with main_tabs[2]:
     st.markdown("### ✅ 오늘 운동 완료 기록")
-    
     if not plan_df.empty and "상태" in plan_df.columns:
         pending_workouts = plan_df[plan_df["상태"] == "⏳ 대기"]
-        
         if not pending_workouts.empty:
             with st.form("mobile_result_form", clear_on_submit=True):
                 workout_options = pending_workouts.apply(lambda r: f"[{r['날짜']}] {r['운동종류']} (목표:{r['목표량']})", axis=1)
-                selected_idx = st.selectbox("완료한 운동을 선택하세요", options=workout_options.index, format_func=lambda x: workout_options[x])
-                
+                selected_idx = st.selectbox("완료한 운동 선택", options=workout_options.index, format_func=lambda x: workout_options[x])
                 actual_amount = st.text_input("실제 수행량 (예: 5km, 90개)")
                 status = st.radio("달성 현황", ["✅ 완료", "⚠️ 미달성"], horizontal=True)
                 
-                submit_result = st.form_submit_button("💾 기록 시트에 최종 저장", use_container_width=True)
-                if submit_result:
+                if st.form_submit_button("💾 기록 시트에 최종 저장", use_container_width=True):
                     target_row = plan_df.loc[selected_idx]
-                    
-                    # 🛠️ [수정] 기록 데이터 적재 시 저장 일시도 대한민국 시간으로 기록
                     now_kst_naive = datetime.datetime.now(KST).replace(tzinfo=None)
-                    record_row = [
-                        target_row["날짜"],
-                        target_row["운동종류"],
-                        actual_amount,
-                        status,
-                        now_kst_naive.strftime("%Y-%m-%d %H:%M:%S")
-                    ]
                     
-                    append_to_sheet(1, record_row)
+                    append_to_sheet(1, [target_row["날짜"], target_row["운동종류"], actual_amount, status, now_kst_naive.strftime("%Y-%m-%d %H:%M:%S")])
                     update_plan_status(int(selected_idx), status)
                     st.cache_data.clear() 
-                    st.success("스프레드시트 결과 반영 성공! 오늘도 고생하셨습니다.")
+                    st.success("스프레드시트에 성공적으로 기록되었습니다!")
                     st.rerun()
         else:
-            st.info("⏳ 대기 중인 계획이 없습니다. 먼저 운동 계획을 세워주세요!")
+            st.info("⏳ 대기 중인 계획이 없습니다.")
     else:
-        st.warning("스프레드시트가 비어있거나 데이터를 가져올 수 없습니다.")
+        st.warning("스프레드시트 데이터를 가져올 수 없습니다.")
+
+# ---------------------------------------------------------
+# 🛠️ Tab 4: ⚙️ 데이터 관리 (수정 및 삭제 통합)
+# ---------------------------------------------------------
+with main_tabs[3]:
+    st.markdown("### ⚙️ 계획 및 기록 데이터 관리")
+    manage_target = st.radio("관리 대상 선택", ["📅 운동 계획 관리", "📋 운동 기록 관리"], horizontal=True)
+    
+    if manage_target == "📅 운동 계획 관리":
+        if not plan_df.empty:
+            plan_options = plan_df.apply(lambda r: f"[{r['날짜']}] {r['운동종류']} - {r['상태']}", axis=1)
+            edit_p_idx = st.selectbox("수정/삭제할 계획 선택", options=plan_options.index, format_func=lambda x: plan_options[x], key="edit_p_select")
+            
+            p_row = plan_df.loc[edit_p_idx]
+            
+            # 수정 폼
+            with st.form("plan_edit_form"):
+                st.markdown("#### 📝 계획 내용 수정")
+                e_date = st.date_input("날짜 변경", datetime.datetime.strptime(str(p_row['날짜']), "%Y-%m-%d").date())
+                e_type = st.text_input("운동종류 변경", value=str(p_row['운동종류']))
+                e_target = st.text_input("목표량 변경", value=str(p_row['목표량']))
+                e_status = st.selectbox("상태 변경", ["⏳ 대기", "✅ 완료", "⚠️ 미달성"], index=["⏳ 대기", "✅ 완료", "⚠️ 미달성"].index(str(p_row['상태'])) if str(p_row['상태']) in ["⏳ 대기", "✅ 완료", "⚠️ 미달성"] else 0)
+                
+                if st.form_submit_button("💾 계획 수정 내용 저장", use_container_width=True):
+                    update_sheet_row(0, int(edit_p_idx), [str(e_date), e_type, e_target, e_status])
+                    st.cache_data.clear()
+                    st.success("계획 정보가 수정되었습니다!")
+                    st.rerun()
+            
+            st.markdown("---")
+            # 위험구역 삭제 버튼
+            if st.button("❌ 선택한 계획 완전 삭제", use_container_width=True, type="secondary"):
+                delete_sheet_row(0, int(edit_p_idx))
+                st.cache_data.clear()
+                st.success("해당 계획이 구글 시트에서 삭제되었습니다.")
+                st.rerun()
+        else:
+            st.info("관리할 운동 계획 데이터가 없습니다.")
+            
+    elif manage_target == "📋 운동 기록 관리":
+        if not record_df.empty:
+            record_options = record_df.apply(lambda r: f"[{r['날짜']}] {r['운동종류']} (수행량: {r['실제수행량']})", axis=1)
+            edit_r_idx = st.selectbox("수정/삭제할 기록 선택", options=record_options.index, format_func=lambda x: record_options[x], key="edit_r_select")
+            
+            r_row = record_df.loc[edit_r_idx]
+            
+            # 수정 폼
+            with st.form("record_edit_form"):
+                st.markdown("#### 📝 기록 내용 수정")
+                er_date = st.date_input("기록 날짜 변경", datetime.datetime.strptime(str(r_row['날짜']), "%Y-%m-%d").date())
+                er_type = st.text_input("운동종류 변경", value=str(r_row['운동종류']))
+                er_actual = st.text_input("실제 수행량 변경", value=str(r_row['실제수행량']))
+                er_status = st.selectbox("달성여부 변경", ["✅ 완료", "⚠️ 미달성"], index=["✅ 완료", "⚠️ 미달성"].index(str(r_row['달성여부'])) if str(r_row['달성여부']) in ["✅ 완료", "⚠️ 미달성"] else 0)
+                
+                if st.form_submit_button("💾 기록 수정 내용 저장", use_container_width=True):
+                    # 기존 입력일시는 유지한 채 데이터만 업데이트
+                    update_sheet_row(1, int(edit_r_idx), [str(er_date), er_type, er_actual, er_status, str(r_row['입력일시'])])
+                    st.cache_data.clear()
+                    st.success("운동 기록 정보가 수정되었습니다!")
+                    st.rerun()
+            
+            st.markdown("---")
+            # 위험구역 삭제 버튼
+            if st.button("❌ 선택한 기록 완전 삭제", use_container_width=True, type="secondary"):
+                delete_sheet_row(1, int(edit_r_idx))
+                st.cache_data.clear()
+                st.success("해당 기록이 구글 시트에서 삭제되었습니다.")
+                st.rerun()
+        else:
+            st.info("관리할 운동 기록 데이터가 없습니다.")
