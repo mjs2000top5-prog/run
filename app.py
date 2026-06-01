@@ -51,15 +51,12 @@ def update_plan_status(row_idx, status_value):
     worksheet = sh.get_worksheet(0)
     worksheet.update_cell(row_idx + 2, 4, status_value)
 
-# 🛠️ [신규 기능] 구글 시트 행 삭제 함수
 def delete_sheet_row(worksheet_idx, row_idx):
     client = get_gspread_client()
     sh = client.open_by_key(SPREADSHEET_ID)
     worksheet = sh.get_worksheet(worksheet_idx)
-    # 헤더 행(1행)이 있으므로 데이터프레임 인덱스에 +2를 하여 삭제
     worksheet.delete_rows(row_idx + 2)
 
-# 🛠️ [신규 기능] 구글 시트 행 수정 함수 (버전 미스매치 방지를 위해 셀 단위 안전 갱신)
 def update_sheet_row(worksheet_idx, row_idx, row_data):
     client = get_gspread_client()
     sh = client.open_by_key(SPREADSHEET_ID)
@@ -151,11 +148,10 @@ st.title("💪 오늘 운동 완료!")
 plan_df = load_sheet_data(0)
 record_df = load_sheet_data(1)
 
-# 🛠️ 관리 탭 메뉴 추가
 main_tabs = st.tabs(["🏠 홈 / 날씨", "📅 운동 계획", "✅ 기록 입력", "⚙️ 수정/삭제"])
 
 # ---------------------------------------------------------
-# Tab 1: 🏠 홈 / 날씨 및 운동 현황
+# Tab 1: 🏠 홈 / 날씨 및 고도화된 달성도 대시보드
 # ---------------------------------------------------------
 with main_tabs[0]:
     st.markdown("### 🌤️ 경기(수원) 시간대별 날씨 예보 (이후 6시간)")
@@ -174,14 +170,56 @@ with main_tabs[0]:
                 st.info("💡 향후 6시간 동안 비 소식이 없습니다. 야외 운동하기 최고입니다!")
 
     st.markdown("---")
-    st.markdown("### 🔥 오늘 나의 달성 현황")
-    if not plan_df.empty and "상태" in plan_df.columns:
-        total_plans = len(plan_df)
-        done_plans = len(plan_df[plan_df["상태"] == "✅ 완료"])
-        success_rate = int((done_plans / total_plans) * 100) if total_plans > 0 else 0
-        st.progress(success_rate / 100, text=f"목표 {total_plans}개 중 {done_plans}개 성공 ({success_rate}%)")
+    
+    # 🛠️ [기능 고도화] 오늘 / 주별 / 월별 진행률 계산 영역
+    st.markdown("### 📊 나의 운동 달성도 분석")
+    
+    if not plan_df.empty and "상태" in plan_df.columns and "날짜" in plan_df.columns:
+        # 안전한 날짜 데이터 매핑 (문자열 -> Date 객체)
+        plan_df['parsed_date'] = pd.to_datetime(plan_df['날짜'], errors='coerce').dt.date
+        current_date = now_kst.date()
+        
+        # 1️⃣ 오늘 진행률
+        today_df = plan_df[plan_df['parsed_date'] == current_date]
+        t_total = len(today_df)
+        t_done = len(today_df[today_df['상태'] == "✅ 완료"])
+        t_rate = int((t_done / t_total) * 100) if t_total > 0 else 0
+        
+        # 2️⃣ 이번 주 진행률 (현재 요일 기준 월요일 ~ 일요일 계산)
+        start_of_week = current_date - datetime.timedelta(days=current_date.weekday())
+        end_of_week = start_of_week + datetime.timedelta(days=6)
+        week_df = plan_df[(plan_df['parsed_date'] >= start_of_week) & (plan_df['parsed_date'] <= end_of_week)]
+        w_total = len(week_df)
+        w_done = len(week_df[week_df['상태'] == "✅ 완료"])
+        w_rate = int((w_done / w_total) * 100) if w_total > 0 else 0
+        
+        # 3️⃣ 이번 달 진행률
+        month_df = plan_df[plan_df['parsed_date'].apply(lambda x: x.year == current_date.year and x.month == current_date.month if pd.notnull(x) else False)]
+        m_total = len(month_df)
+        m_done = len(month_df[month_df['상태'] == "✅ 완료"])
+        m_rate = int((m_done / m_total) * 100) if m_total > 0 else 0
+        
+        # 모바일용 스택 레이아웃 출력
+        st.markdown("**📅 오늘 달성률**")
+        if t_total > 0:
+            st.progress(t_rate / 100, text=f"{t_total}개 중 {t_done}개 성공 ({t_rate}%)")
+        else:
+            st.caption("오늘 예정된 운동 계획이 없습니다.")
+            
+        st.markdown("**📅 이번 주 달성률 (월~일)**")
+        if w_total > 0:
+            st.progress(w_rate / 100, text=f"{w_total}개 중 {w_done}개 성공 ({w_rate}%)")
+        else:
+            st.caption("이번 주에 등록된 운동 계획이 없습니다.")
+            
+        st.markdown("**📅 이번 달 달성률**")
+        if m_total > 0:
+            st.progress(m_rate / 100, text=f"{m_total}개 중 {m_done}개 성공 ({m_rate}%)")
+        else:
+            st.caption("이번 달에 등록된 운동 계획이 없습니다.")
+            
     else:
-        st.caption("⏳ 아직 등록된 운동 계획이 없습니다.")
+        st.caption("⏳ 데이터 분석을 위해 먼저 운동 계획을 등록해 주세요!")
 
     st.markdown("---")
     st.markdown("### 📋 전체 계획 내역")
@@ -190,6 +228,9 @@ with main_tabs[0]:
         display_df = plan_df
         if filter_status != "전체":
             display_df = plan_df[plan_df["상태"] == filter_status]
+        # 임시 생성한 날짜 파싱 컬럼은 제외하고 출력
+        if 'parsed_date' in display_df.columns:
+            display_df = display_df.drop(columns=['parsed_date'])
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
 # ---------------------------------------------------------
@@ -238,7 +279,7 @@ with main_tabs[2]:
         st.warning("스프레드시트 데이터를 가져올 수 없습니다.")
 
 # ---------------------------------------------------------
-# 🛠️ Tab 4: ⚙️ 데이터 관리 (수정 및 삭제 통합)
+# Tab 4: ⚙️ 데이터 관리 (수정 및 삭제 통합)
 # ---------------------------------------------------------
 with main_tabs[3]:
     st.markdown("### ⚙️ 계획 및 기록 데이터 관리")
@@ -248,10 +289,8 @@ with main_tabs[3]:
         if not plan_df.empty:
             plan_options = plan_df.apply(lambda r: f"[{r['날짜']}] {r['운동종류']} - {r['상태']}", axis=1)
             edit_p_idx = st.selectbox("수정/삭제할 계획 선택", options=plan_options.index, format_func=lambda x: plan_options[x], key="edit_p_select")
-            
             p_row = plan_df.loc[edit_p_idx]
             
-            # 수정 폼
             with st.form("plan_edit_form"):
                 st.markdown("#### 📝 계획 내용 수정")
                 e_date = st.date_input("날짜 변경", datetime.datetime.strptime(str(p_row['날짜']), "%Y-%m-%d").date())
@@ -266,8 +305,7 @@ with main_tabs[3]:
                     st.rerun()
             
             st.markdown("---")
-            # 위험구역 삭제 버튼
-            if st.button("❌ 선택한 계획 완전 삭제", use_container_width=True, type="secondary"):
+            if st.button("❌ 선택한 계획 완전 삭제", use_container_width=True):
                 delete_sheet_row(0, int(edit_p_idx))
                 st.cache_data.clear()
                 st.success("해당 계획이 구글 시트에서 삭제되었습니다.")
@@ -279,10 +317,8 @@ with main_tabs[3]:
         if not record_df.empty:
             record_options = record_df.apply(lambda r: f"[{r['날짜']}] {r['운동종류']} (수행량: {r['실제수행량']})", axis=1)
             edit_r_idx = st.selectbox("수정/삭제할 기록 선택", options=record_options.index, format_func=lambda x: record_options[x], key="edit_r_select")
-            
             r_row = record_df.loc[edit_r_idx]
             
-            # 수정 폼
             with st.form("record_edit_form"):
                 st.markdown("#### 📝 기록 내용 수정")
                 er_date = st.date_input("기록 날짜 변경", datetime.datetime.strptime(str(r_row['날짜']), "%Y-%m-%d").date())
@@ -291,15 +327,13 @@ with main_tabs[3]:
                 er_status = st.selectbox("달성여부 변경", ["✅ 완료", "⚠️ 미달성"], index=["✅ 완료", "⚠️ 미달성"].index(str(r_row['달성여부'])) if str(r_row['달성여부']) in ["✅ 완료", "⚠️ 미달성"] else 0)
                 
                 if st.form_submit_button("💾 기록 수정 내용 저장", use_container_width=True):
-                    # 기존 입력일시는 유지한 채 데이터만 업데이트
                     update_sheet_row(1, int(edit_r_idx), [str(er_date), er_type, er_actual, er_status, str(r_row['입력일시'])])
                     st.cache_data.clear()
                     st.success("운동 기록 정보가 수정되었습니다!")
                     st.rerun()
             
             st.markdown("---")
-            # 위험구역 삭제 버튼
-            if st.button("❌ 선택한 기록 완전 삭제", use_container_width=True, type="secondary"):
+            if st.button("❌ 선택한 기록 완전 삭제", use_container_width=True):
                 delete_sheet_row(1, int(edit_r_idx))
                 st.cache_data.clear()
                 st.success("해당 기록이 구글 시트에서 삭제되었습니다.")
